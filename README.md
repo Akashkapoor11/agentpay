@@ -1,4 +1,4 @@
-# AgentPay 2.0 — Proof-Backed Procurement for AI Commerce
+# AgentPay 2.0 - Proof-Backed Procurement for AI Commerce
 
 **AI can prepare the purchase. Only verified intent can move money.**
 
@@ -208,20 +208,7 @@ The smoke test does not call external services or move money. Import `backend/po
 
 Never use live PayPal credentials or real money for the hackathon demo. Never commit credentials, access tokens, private signing keys or `.env` files.
 
-## Render deployment
-
-`render.yaml` defines the frontend, backend, PostgreSQL and Workflow resources. After deployment:
-
-- Set `NEXT_PUBLIC_API_BASE_URL` to the backend URL.
-- Set `AGENTPAY_PUBLIC_URL` to the backend URL.
-- Set `FRONTEND_ORIGIN` to the frontend origin.
-- Configure the same `WORKFLOW_SHARED_SECRET` on backend and Workflow services.
-- Set backend `RENDER_API_KEY` and `RENDER_WORKFLOW_TASK_SLUG` only if the workflow service is deployed and tested.
-- Confirm `/api/health` returns ready and that the frontend can reach the backend.
-
-The repository contains deployment configuration; a working hosted deployment must still be created and verified by the entrant.
-
-## Sponsor integration honesty
+## Sponsor integration 
 
 - **AG Grid / AG Studio:** AG Grid powers the evidence/market tables. AG Studio 3.1 is embedded with a server-side OpenAI adapter and read-only analytics intent; supporting AG Grid 36.3 and AG Charts 14.3 versions are aligned. Confirm the sponsor's current prize requirements and live UI behaviour before selecting its prize.
 - **Channel3:** meaningful only when a live configured API response is shown in the product. The external results remain evidence/context, not checkout inventory.
@@ -245,10 +232,3 @@ The repository contains deployment configuration; a working hosted deployment mu
 MIT. See `LICENSE`.
 
 
-## Postman end-to-end verification
-
-Import `backend/postman/AgentPay.postman_collection.json` into Postman and set `baseUrl` to your backend. Run the requests in order: Health, AI Agent, Tampered Cart (expect HTTP 403 and `paypalOrderCreated=false`), Create Sandbox Order, manually approve the returned `approveUrl` using a Sandbox buyer, Capture, Purchase Proof, then run the optional Render reconciliation and idempotency retry requests. Set `workflowSecret` only in a private Postman environment; never commit it. The AI Agent test stores the mandate, selected cart and agent-run ID for subsequent requests.
-
-### Next.js request proxy
-
-The backend uses Next.js 16 `proxy.js` for API CORS and preflight handling. It is an origin policy only; it is not user authentication, authorization or tenant isolation.
