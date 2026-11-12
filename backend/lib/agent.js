@@ -135,17 +135,21 @@ function deterministic(input, fallbackReason = 'AI execution was unavailable.') 
 }
 
 export async function runAgent(input) {
-  const fallbackReasonBase = !process.env.OPENAI_API_KEY
-    ? 'OPENAI_API_KEY is not configured.'
-    : 'OpenAI did not return a usable plan.';
+  const hasKey = !!process.env.OPENAI_API_KEY;
+  const baseURL = process.env.OPENAI_BASE_URL || undefined;
+  const model = process.env.OPENAI_MODEL || 'gpt-4o';
 
-  // AI API is always attempted first. Deterministic mode is entered only after
-  // the AI API call/path fails or returns an unusable result.
+  if (!hasKey) return deterministic(input, 'OPENAI_API_KEY is not configured.');
+
+  // AI API (OpenAI or OpenRouter-compatible Chat Completions) is always attempted first.
+  // Deterministic mode is entered only after the API call/path fails or returns unusable result.
   try {
-      const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
-      const tools = [
-        {
-          type: 'function',
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, ...(baseURL ? { baseURL } : {}) });
+
+    const tools = [
+      {
+        type: 'function',
+        function: {
           name: 'search_catalog',
           description: 'Search approved merchant offers. Never invent product IDs or prices.',
           strict: true,
@@ -158,9 +162,11 @@ export async function runAgent(input) {
             required: ['query', 'maxDeliveryDays'],
             additionalProperties: false
           }
-        },
-        {
-          type: 'function',
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'score_offer',
           description: 'Calculate a demo-catalogue constraint-fit indicator from the local delivery estimate, sample unit price and keyword matches only. This is not a trust, fraud, quality or sustainability score.',
           strict: true,
@@ -174,208 +180,134 @@ export async function runAgent(input) {
             additionalProperties: false
           }
         }
-      ];
-      const paypalMcpTool = await getPayPalMcpTool().catch(() => null);
-      if (paypalMcpTool) tools.push(paypalMcpTool);
-      const outputFormat = {
-        type: 'json_schema',
-        name: 'agentpay_plan',
-        description: 'A bounded purchase plan that stays inside the buyer request.',
-        strict: true,
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            title: { type: 'string' },
-            userGoal: { type: 'string' },
-            maxTotal: { type: 'number', minimum: 0 },
-            maxDeliveryDays: { type: 'number', minimum: 1 },
-            allowedCategories: { type: 'array', items: { type: 'string' } },
-            allowedMerchants: { type: 'array', items: { type: 'string' } },
-            preferredAttributes: { type: 'array', items: { type: 'string' } },
-            selectedItems: {
-              type: 'array',
-              minItems: 1,
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  productId: { type: 'string' },
-                  quantity: { type: 'integer', minimum: 1, maximum: 50 }
-                },
-                required: ['productId', 'quantity']
-              }
-            },
-            rationale: { type: 'string' },
-            whyNotCheapest: { type: 'string' }
-          },
-          required: [
-            'title', 'userGoal', 'maxTotal', 'maxDeliveryDays',
-            'allowedCategories', 'allowedMerchants', 'preferredAttributes',
-            'selectedItems', 'rationale', 'whyNotCheapest'
-          ]
-        }
-      };
-      const model = process.env.OPENAI_MODEL || 'gpt-6-astra';
-      const requestOptions = {
+      }
+    ];
+
+    const messages = [
+      { role: 'system', content: SYSTEM },
+      { role: 'user', content: input.request }
+    ];
+
+    let lastCandidates = [];
+    let lastChannel3Offers = [];
+    let lastChannel3Summary = null;
+    let lastChannel3Warning = null;
+    const scoredProducts = new Set();
+    const toolUsage = { search: false, score: false, scoreSuccess: false };
+
+    for (let turn = 0; turn < 6; turn += 1) {
+      const response = await client.chat.completions.create({
         model,
+        messages,
         tools,
-        parallel_tool_calls: false,
-        text: { format: outputFormat, verbosity: 'low' }
-      };
-      let response = await client.responses.create({
-        ...requestOptions,
-        instructions: SYSTEM,
-        input: input.request
+        tool_choice: toolUsage.search && toolUsage.scoreSuccess ? 'none' : 'auto',
+        response_format: toolUsage.search && toolUsage.scoreSuccess
+          ? { type: 'json_object' }
+          : undefined
       });
-      let lastCandidates = [];
-      let lastChannel3Offers = [];
-      let lastChannel3Summary = null;
-      let lastChannel3Warning = null;
-      const scoredProducts = new Set();
-      const toolUsage = { search: false, score: false, scoreSuccess: false, paypalMcp: false };
 
-      for (let turn = 0; turn < 4; turn += 1) {
-        if (response.status !== 'completed') {
-          const details = response.error || response.incomplete_details;
-          throw new Error(`OpenAI response ${response.status || 'unknown'}: ${details ? JSON.stringify(details) : 'no details'}`);
+      const choice = response.choices?.[0];
+      if (!choice) throw new Error('OpenAI returned no choices.');
+      const msg = choice.message;
+      messages.push(msg);
+
+      // No more tool calls — parse the final JSON plan
+      if (!msg.tool_calls || msg.tool_calls.length === 0) {
+        const rawText = msg.content;
+        if (!rawText) throw new Error('OpenAI returned no structured plan.');
+        let raw;
+        try { raw = JSON.parse(rawText); } catch { throw new Error('OpenAI returned an invalid structured plan.'); }
+        if (!toolUsage.search || !toolUsage.scoreSuccess) {
+          throw new Error('OpenAI did not complete the required catalog discovery and offer-scoring tool steps.');
         }
-
-        if (response.output.some((item) => ['mcp_call', 'mcp_tool_call'].includes(item.type) && item.status === 'completed' && (!item.server_label || item.server_label === 'paypal_sandbox_readonly'))) toolUsage.paypalMcp = true;
-        const calls = response.output.filter((item) => item.type === 'function_call');
-        if (!calls.length) {
-          const rawText = response.output_text;
-          if (!rawText) throw new Error('OpenAI returned no structured plan.');
-          let raw;
-          try {
-            raw = JSON.parse(rawText);
-          } catch {
-            throw new Error('OpenAI returned an invalid structured plan.');
-          }
-          if (!toolUsage.search || !toolUsage.scoreSuccess) {
-            throw new Error('OpenAI did not complete the required catalog discovery and offer-scoring tool steps.');
-          }
-          if (!Array.isArray(raw.selectedItems) || raw.selectedItems.length === 0) {
-            throw new Error('OpenAI returned an incomplete agent plan.');
-          }
-          const seen = new Set(lastCandidates.map((item) => item.id));
-          if (raw.selectedItems.some((item) => !seen.has(String(item.productId)))) {
-            throw new Error('OpenAI selected a product that was not returned by the approved catalog search.');
-          }
-          if (raw.selectedItems.some((item) => !scoredProducts.has(String(item.productId)))) {
-            throw new Error('OpenAI selected a product that was not successfully scored by the approved offer tool.');
-          }
-          return buildResult(
-            { request: input.request, alternatives: lastCandidates, agentRunId: input.agentRunId },
-            raw,
-            { agentMode: 'openai-tools', fallbackReason: null, channel3Offers: lastChannel3Offers, channel3Summary: lastChannel3Summary, channel3Warning: lastChannel3Warning, paypalMcpUsed: toolUsage.paypalMcp }
-          );
+        if (!Array.isArray(raw.selectedItems) || raw.selectedItems.length === 0) {
+          throw new Error('OpenAI returned an incomplete agent plan.');
         }
-
-        const outputs = [];
-        for (const call of calls) {
-          if (!call.call_id) throw new Error(`OpenAI returned a tool call without a call_id.`);
-          let args;
-          try {
-            args = JSON.parse(call.arguments || '{}');
-          } catch {
-            throw new Error(`OpenAI returned invalid tool arguments for ${call.name}.`);
-          }
-
-          let result;
-          if (call.name === 'search_catalog') {
-            const delivery = Number(args.maxDeliveryDays);
-            if (!args.query || !Number.isFinite(delivery) || delivery < 1 || delivery > 30) {
-              throw new Error('OpenAI requested invalid catalog search constraints.');
-            }
-            // External market API first. The local catalog is the execution allowlist,
-            // not an alternative source of truth. It is queried only after the external
-            // discovery call returns, or when Channel3 is not configured.
-            const buyerConstraints = parseConstraints(input.request);
-            let channel3ErrorMessage = null;
-            if (process.env.CHANNEL3_API_KEY) {
-              try {
-                const channel3UnitCeiling = buyerConstraints.budgetExplicit
-                  ? Number((buyerConstraints.budget / Math.max(1, buyerConstraints.quantity)).toFixed(2))
-                  : undefined;
-                const external = await channel3Search(args.query, { maxPrice: channel3UnitCeiling, limit: 6, userId: input.agentRunId });
-                lastChannel3Offers = external.offers || [];
-                lastChannel3Warning = null;
-                if (lastChannel3Offers.length) {
-                  const currencyGroups = new Map();
-                  for (const offer of lastChannel3Offers) {
-                    const currency = String(offer.currency || 'UNKNOWN').toUpperCase();
-                    if (!currencyGroups.has(currency)) currencyGroups.set(currency, []);
-                    if (Number.isFinite(Number(offer.price)) && Number(offer.price) > 0) currencyGroups.get(currency).push(Number(offer.price));
-                  }
-                  const primaryCurrency = [...currencyGroups.entries()].filter(([currency, values]) => currency !== 'UNKNOWN' && values.length > 0).sort((a, b) => b[1].length - a[1].length)[0]?.[0] || null;
-                  const prices = (currencyGroups.get(primaryCurrency) || []).sort((a, b) => a - b);
-                  lastChannel3Summary = { count: lastChannel3Offers.length, pricedOfferCount: prices.length, lowestPrice: prices[0] ?? null, medianPrice: prices.length ? prices[Math.floor(prices.length / 2)] : null, currency: primaryCurrency, retrievedAt: new Date().toISOString(), note: 'External product observations. Prices are grouped by reported currency and are not a verified like-for-like market benchmark.' };
-                }
-              } catch (channel3Error) {
-                channel3ErrorMessage = channel3Error?.message || 'Channel3 unavailable';
-                lastChannel3Warning = channel3ErrorMessage;
-              }
-            }
-
-            // PayPal checkout is allowlisted against this local catalog. This lookup
-            // follows the Channel3 call so API-first order is preserved.
-            const maxUnitPrice = buyerConstraints.budgetExplicit
-              ? Math.floor(toCents(buyerConstraints.budget) / Math.max(1, buyerConstraints.quantity)) / 100
-              : undefined;
-            const approvedOffers = searchProducts(args.query, { maxDeliveryDays: delivery, maxUnitPrice }, 8);
-            lastCandidates = approvedOffers;
-            result = {
-              approvedOffers,
-              channel3Offers: lastChannel3Offers,
-              channel3Summary: lastChannel3Summary,
-              source: process.env.CHANNEL3_API_KEY ? 'channel3+approved-catalog' : 'approved-catalog',
-              ...(channel3ErrorMessage ? { channel3Warning: channel3ErrorMessage } : {})
-            };
-
-            toolUsage.search = true;
-          } else if (call.name === 'score_offer') {
-            toolUsage.score = true;
-            const product = getProduct(args.productId);
-            const quantity = Number(args.quantity);
-            const wasSearched = lastCandidates.some((item) => item.id === String(args.productId));
-            if (!wasSearched) {
-              result = { error: 'Product must come from the latest approved catalog search.' };
-            } else if (!product || !Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
-              result = { error: 'Invalid approved product or quantity.' };
-            } else {
-              toolUsage.scoreSuccess = true;
-              scoredProducts.add(product.id);
-              result = {
-                product,
-                constraintFit: Number((
-                  (100 - Math.min(product.shippingDays * 12, 100)) * 0.55 +
-                  (100 - Math.min(product.price / 5, 100)) * 0.25 +
-                  Math.min(product.keywordMatches * 10, 100) * 0.20
-                ).toFixed(1)),
-                fixtureSource: product.fixtureSource,
-                fitSignals: [`delivery estimate: ${product.shippingDays} days`, `demo catalogue unit price: $${product.price.toFixed(2)}`, `keyword matches: ${product.keywordMatches}`]
-              };
-            }
-          } else {
-            throw new Error(`Unsupported AI tool call: ${call.name}.`);
-          }
-
-          outputs.push({
-            type: 'function_call_output',
-            call_id: call.call_id,
-            output: JSON.stringify(result)
-          });
+        const seen = new Set(lastCandidates.map((item) => item.id));
+        if (raw.selectedItems.some((item) => !seen.has(String(item.productId)))) {
+          throw new Error('OpenAI selected a product that was not returned by the approved catalog search.');
         }
-
-        response = await client.responses.create({
-          ...requestOptions,
-          previous_response_id: response.id,
-          input: outputs
-        });
+        if (raw.selectedItems.some((item) => !scoredProducts.has(String(item.productId)))) {
+          throw new Error('OpenAI selected a product that was not successfully scored by the approved offer tool.');
+        }
+        return buildResult(
+          { request: input.request, alternatives: lastCandidates, agentRunId: input.agentRunId },
+          raw,
+          { agentMode: 'openai-tools', fallbackReason: null, channel3Offers: lastChannel3Offers, channel3Summary: lastChannel3Summary, channel3Warning: lastChannel3Warning }
+        );
       }
 
-      throw new Error(fallbackReasonBase);
+      // Handle tool calls
+      const toolResults = [];
+      for (const tc of msg.tool_calls) {
+        let args;
+        try { args = JSON.parse(tc.function.arguments || '{}'); } catch { throw new Error(`Invalid tool arguments for ${tc.function.name}.`); }
+
+        let result;
+        if (tc.function.name === 'search_catalog') {
+          const delivery = Number(args.maxDeliveryDays);
+          if (!args.query || !Number.isFinite(delivery) || delivery < 1 || delivery > 30) {
+            throw new Error('OpenAI requested invalid catalog search constraints.');
+          }
+          const buyerConstraints = parseConstraints(input.request);
+          let channel3ErrorMessage = null;
+          if (process.env.CHANNEL3_API_KEY) {
+            try {
+              const channel3UnitCeiling = buyerConstraints.budgetExplicit
+                ? Number((buyerConstraints.budget / Math.max(1, buyerConstraints.quantity)).toFixed(2))
+                : undefined;
+              const external = await channel3Search(args.query, { maxPrice: channel3UnitCeiling, limit: 6, userId: input.agentRunId });
+              lastChannel3Offers = external.offers || [];
+              if (lastChannel3Offers.length) {
+                const currencyGroups = new Map();
+                for (const offer of lastChannel3Offers) {
+                  const currency = String(offer.currency || 'UNKNOWN').toUpperCase();
+                  if (!currencyGroups.has(currency)) currencyGroups.set(currency, []);
+                  if (Number.isFinite(Number(offer.price)) && Number(offer.price) > 0) currencyGroups.get(currency).push(Number(offer.price));
+                }
+                const primaryCurrency = [...currencyGroups.entries()].filter(([c, v]) => c !== 'UNKNOWN' && v.length > 0).sort((a, b) => b[1].length - a[1].length)[0]?.[0] || null;
+                const prices = (currencyGroups.get(primaryCurrency) || []).sort((a, b) => a - b);
+                lastChannel3Summary = { count: lastChannel3Offers.length, pricedOfferCount: prices.length, lowestPrice: prices[0] ?? null, medianPrice: prices.length ? prices[Math.floor(prices.length / 2)] : null, currency: primaryCurrency, retrievedAt: new Date().toISOString(), note: 'External product observations. Prices are grouped by reported currency and are not a verified like-for-like market benchmark.' };
+              }
+            } catch (e) {
+              channel3ErrorMessage = e?.message || 'Channel3 unavailable';
+              lastChannel3Warning = channel3ErrorMessage;
+            }
+          }
+          const maxUnitPrice = buyerConstraints.budgetExplicit
+            ? Math.floor(toCents(buyerConstraints.budget) / Math.max(1, buyerConstraints.quantity)) / 100
+            : undefined;
+          const approvedOffers = searchProducts(args.query, { maxDeliveryDays: delivery, maxUnitPrice }, 8);
+          lastCandidates = approvedOffers;
+          result = { approvedOffers, channel3Offers: lastChannel3Offers, channel3Summary: lastChannel3Summary, source: process.env.CHANNEL3_API_KEY ? 'channel3+approved-catalog' : 'approved-catalog', ...(channel3ErrorMessage ? { channel3Warning: channel3ErrorMessage } : {}) };
+          toolUsage.search = true;
+        } else if (tc.function.name === 'score_offer') {
+          toolUsage.score = true;
+          const product = getProduct(args.productId);
+          const quantity = Number(args.quantity);
+          const wasSearched = lastCandidates.some((item) => item.id === String(args.productId));
+          if (!wasSearched) {
+            result = { error: 'Product must come from the latest approved catalog search.' };
+          } else if (!product || !Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
+            result = { error: 'Invalid approved product or quantity.' };
+          } else {
+            toolUsage.scoreSuccess = true;
+            scoredProducts.add(product.id);
+            result = {
+              product,
+              constraintFit: Number(((100 - Math.min(product.shippingDays * 12, 100)) * 0.55 + (100 - Math.min(product.price / 5, 100)) * 0.25 + Math.min((product.keywordMatches || 0) * 10, 100) * 0.20).toFixed(1)),
+              fixtureSource: product.fixtureSource,
+              fitSignals: [`delivery estimate: ${product.shippingDays} days`, `demo catalogue unit price: $${product.price.toFixed(2)}`, `keyword matches: ${product.keywordMatches || 0}`]
+            };
+          }
+        } else {
+          result = { error: `Unsupported tool: ${tc.function.name}` };
+        }
+        toolResults.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
+      }
+      messages.push(...toolResults);
+    }
+    throw new Error('OpenAI did not return a plan within the allowed turns.');
   } catch (error) {
     return deterministic(input, error?.message || 'OpenAI execution failed.');
   }
