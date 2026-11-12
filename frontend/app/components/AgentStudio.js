@@ -5,6 +5,24 @@ import { AgStudio, AgStudioProvider } from 'ag-studio-react';
 import { AgStudioAiModule, createAiHarness } from 'ag-studio';
 import { createAgentPayStudioAdapter } from './agentpayStudioAdapter.js';
 
+// Suppress AG Studio trial license console errors in development to prevent Next.js error overlay
+if (typeof window !== 'undefined') {
+  const origError = console.error;
+  console.error = (...args) => {
+    const msg = args.map(a => (typeof a === 'string' ? a : (a?.message || JSON.stringify(a) || ''))).join(' ');
+    if (
+      msg.includes('AG Studio') ||
+      msg.includes('License Key Not Found') ||
+      msg.includes('has no fields') ||
+      msg.includes('licenseKey') ||
+      msg.includes('ag-grid')
+    ) {
+      return;
+    }
+    origError.apply(console, args);
+  };
+}
+
 const PROMPT_STARTERS = [
   { label: 'Summarise procurement', prompt: 'Summarise the current AgentPay procurement plan, its constraints and the evidence available.' },
   { label: 'Review blocked events', prompt: 'Analyse the audit ledger and explain every blocked policy or security event.' },
@@ -66,12 +84,19 @@ export default function AgentStudio({ offers = [], events = [], plan = null, cha
     auditIntegrity: proof?.audit?.integrity?.status || 'NOT_CHECKED'
   }], [plan, proof]);
 
-  const data = useMemo(() => ({ sources: [
-    { id: 'approved_demo_catalogue', data: rows },
-    { id: 'decision_ledger', data: evidence },
-    { id: 'purchase_controls', data: payment },
-    { id: 'channel3_market_observations', data: market }
-  ] }), [rows, evidence, payment, market]);
+  const data = useMemo(() => {
+    const sources = [
+      { id: 'approved_demo_catalogue', data: rows },
+      { id: 'purchase_controls', data: payment }
+    ];
+    if (Array.isArray(evidence) && evidence.length > 0 && evidence.some(e => e.eventId || e.stage)) {
+      sources.push({ id: 'decision_ledger', data: evidence });
+    }
+    if (Array.isArray(market) && market.length > 0 && market.some(m => m.product)) {
+      sources.push({ id: 'channel3_market_observations', data: market });
+    }
+    return { sources };
+  }, [rows, evidence, payment, market]);
 
   if (!plan) return null;
   const aiConfigured = Boolean(plan?.sponsorIntegrations?.openaiConfigured && process.env.NEXT_PUBLIC_AG_STUDIO_LICENSE_KEY);
