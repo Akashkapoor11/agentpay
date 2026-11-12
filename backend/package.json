@@ -1,0 +1,26 @@
+{
+  "name": "agentpay-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 4000",
+    "build": "next build",
+    "start": "next start -p 4000",
+    "smoke": "node scripts/smoke-test.mjs",
+    "keys:generate": "node scripts/generate-mandate-keys.mjs",
+    "db:schema": "node --env-file=.env.local scripts/db-schema.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "next": "16.4.6",
+    "openai": "7.17.0",
+    "pg": "8.23.1",
+    "@renderinc/sdk": "1.7.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "type": "module",
+  "license": "MIT"
+}

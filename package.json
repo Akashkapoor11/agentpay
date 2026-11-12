@@ -1,0 +1,29 @@
+{
+  "name": "agentpay",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend",
+    "backend/workflows"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=agentpay-frontend",
+    "dev:frontend": "npm run dev --workspace=agentpay-frontend",
+    "dev:backend": "npm run dev --workspace=agentpay-backend",
+    "build": "npm run build --workspace=agentpay-backend && npm run build --workspace=agentpay-frontend",
+    "build:frontend": "npm run build --workspace=agentpay-frontend",
+    "build:backend": "npm run build --workspace=agentpay-backend",
+    "smoke": "npm run smoke --workspace=agentpay-backend",
+    "source-check": "node backend/scripts/source-check.mjs",
+    "keys:generate": "npm run keys:generate --workspace=agentpay-backend",
+    "db:schema": "npm run db:schema --workspace=agentpay-backend",
+    "workflows:build": "npm run build --workspace=backend-workflows",
+    "verify": "npm run source-check && npm run smoke && npm run workflows:build && npm run build:backend && npm run build:frontend"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "MIT",
+  "description": "AgentPay \u2014 verifiable trust layer for AI commerce."
+}

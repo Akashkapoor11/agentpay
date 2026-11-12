@@ -1,0 +1,330 @@
+{
+  "info": {
+    "name": "AgentPay 2.0 \u2014 End-to-End PayPal Sandbox + Sponsor API",
+    "description": "Run in order. This collection calls the live AgentPay backend. Run AI Agent first, run the tamper request (must be blocked), then create a Sandbox order. Open approveUrl in a browser and approve with a PayPal Sandbox buyer before running Capture. Only then run Purchase Proof and optional Render Workflow Reconciliation. Never use production credentials or real money.",
+    "_postman_id": "agentpay-2026-e2e",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:4000"
+    },
+    {
+      "key": "mandateId",
+      "value": ""
+    },
+    {
+      "key": "mandateJson",
+      "value": "{}"
+    },
+    {
+      "key": "itemsJson",
+      "value": "[]"
+    },
+    {
+      "key": "tamperedItemsJson",
+      "value": "[]"
+    },
+    {
+      "key": "agentRunId",
+      "value": ""
+    },
+    {
+      "key": "orderID",
+      "value": ""
+    },
+    {
+      "key": "approveUrl",
+      "value": ""
+    },
+    {
+      "key": "captureId",
+      "value": ""
+    },
+    {
+      "key": "workflowSecret",
+      "value": ""
+    },
+    {
+      "key": "workflowRunId",
+      "value": "postman-manual"
+    }
+  ],
+  "item": [
+    {
+      "name": "01 \u2014 Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/api/health",
+        "description": "Confirm backend configuration and database status. Verify the response reports the expected Sandbox configuration."
+      }
+    },
+    {
+      "name": "02 \u2014 Run AI Agent",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/api/agent",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"request\": \"Buy 2 ergonomic office chairs under $500 total, deliver within 4 days, and only use the office category.\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "description": "This request is deliberately bounded and includes an explicit budget. Requires PostgreSQL and OpenAI credentials. If the response says deterministic-fallback, do not claim the live AI path in the demo."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Agent endpoint returns 200', function () { pm.response.to.have.status(200); });",
+              "const d = pm.response.json();",
+              "pm.test('A signed mandate and non-empty cart are returned', function () { pm.expect(d.mandate && d.mandate.mandateId).to.be.a('string'); pm.expect(d.selectedItems).to.be.an('array').that.is.not.empty; });",
+              "pm.test('Policy must pass before checkout', function () { pm.expect(d.policy.status).to.eql('PASS'); });",
+              "pm.collectionVariables.set('mandateId', d.mandate.mandateId);",
+              "pm.collectionVariables.set('agentRunId', d.agentRunId || '');",
+              "pm.collectionVariables.set('mandateJson', JSON.stringify(d.mandate));",
+              "const items = d.selectedItems.map(({ id, quantity }) => ({ id, quantity }));",
+              "pm.collectionVariables.set('itemsJson', JSON.stringify(items));",
+              "const chosen = new Set(items.map((x) => x.id));",
+              "const alternative = (d.alternatives || []).find((x) => x && x.id && !chosen.has(x.id));",
+              "const tampered = items.map((item, index) => index === 0 ? { ...item, id: alternative?.id || '__agentpay_unapproved_sku__' } : item);",
+              "pm.collectionVariables.set('tamperedItemsJson', JSON.stringify(tampered));",
+              "pm.collectionVariables.set('tamperMode', alternative ? 'approved-catalogue SKU substitution' : 'unapproved SKU substitution');",
+              "pm.test('Live AI path is used for the AI claim', function () { pm.expect(d.agentMode).to.eql('openai-tools'); });",
+              "pm.collectionVariables.set('agentMode', d.agentMode || 'unknown');"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 \u2014 Reject Tampered Cart (must fail before PayPal)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/api/paypal/create-order",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"mandate\": {{mandateJson}},\n  \"items\": {{tamperedItemsJson}}\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "description": "This changes the selected SKU after the mandate was signed. Expected: HTTP 403 and paypalOrderCreated=false. The request must be rejected by the real create-order route, before any PayPal order call."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Tampered cart is blocked with HTTP 403', function () { pm.response.to.have.status(403); });",
+              "const d = pm.response.json();",
+              "pm.test('No PayPal order was created', function () { pm.expect(d.blocked).to.eql(true); pm.expect(d.paypalOrderCreated).to.eql(false); });",
+              "pm.test('Block explanation is present', function () { pm.expect(d.error).to.be.a('string').and.not.empty; });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 \u2014 Create PayPal Sandbox Order",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/api/paypal/create-order",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"mandate\": {{mandateJson}},\n  \"items\": {{itemsJson}}\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "description": "Creates a PayPal Sandbox order only after the server verifies the stored mandate, exact cart, canonical catalogue prices and deterministic policy. The response includes approveUrl when PayPal returns an approval link. Open it in a browser and approve using a PayPal Sandbox buyer before running the next request."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('PayPal order is created', function () { pm.response.to.have.status(200); });",
+              "const d = pm.response.json();",
+              "pm.test('Order ID is returned', function () { pm.expect(d.id).to.be.a('string').and.not.empty; });",
+              "pm.test('Approval URL is returned for manual Sandbox approval', function () { pm.expect(d.approveUrl).to.be.a('string').and.match(/^https:\\/\\//); });",
+              "pm.collectionVariables.set('orderID', d.id);",
+              "pm.collectionVariables.set('approveUrl', d.approveUrl || '');"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 \u2014 Capture Approved PayPal Sandbox Order",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/api/paypal/capture-order",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"orderID\": \"{{orderID}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "description": "Precondition: open the saved approveUrl in a browser and approve the order with a Sandbox buyer. Then run this request. The backend re-fetches the PayPal order, verifies the mandate/cart/amount/currency and captures server-side."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('PayPal capture completed', function () { pm.response.to.have.status(200); });",
+              "const d = pm.response.json();",
+              "pm.test('Completed capture ID is present', function () { pm.expect(d.status).to.eql('COMPLETED'); pm.expect(d.captureId).to.be.a('string').and.not.empty; });",
+              "pm.collectionVariables.set('captureId', d.captureId);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "06 \u2014 Purchase Proof",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/api/proof?mandateId={{mandateId}}",
+        "description": "Fetch the complete proof after capture. Confirm real PayPal order/capture IDs, matching amount/currency, and audit.integrity.status = VERIFIED. If legacy events are present, review the legacy event count."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Purchase proof returns 200', function () { pm.response.to.have.status(200); });",
+              "const d = pm.response.json().proof;",
+              "pm.test('Proof links the PayPal order and capture', function () { pm.expect(d.payment.orderId).to.eql(pm.collectionVariables.get('orderID')); pm.expect(d.payment.captureId).to.eql(pm.collectionVariables.get('captureId')); pm.expect(d.payment.captureStatus).to.eql('COMPLETED'); });",
+              "pm.test('Audit chain is verified', function () { pm.expect(['VERIFIED', 'VERIFIED_WITH_LEGACY_EVENTS']).to.include(d.audit.integrity.status); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "07 \u2014 Optional Render Workflow Reconciliation",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer {{workflowSecret}}"
+          }
+        ],
+        "url": "{{baseUrl}}/api/workflow/reconcile",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"mandateId\": \"{{mandateId}}\",\n  \"agentRunId\": \"{{agentRunId}}\",\n  \"paypalOrderId\": \"{{orderID}}\",\n  \"paypalCaptureId\": \"{{captureId}}\",\n  \"workflowRunId\": \"{{workflowRunId}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "description": "Optional. Set workflowSecret to the same WORKFLOW_SHARED_SECRET configured on the backend. Only call this after successful capture. Repeating the same capture is expected to return duplicate=true without appending duplicate reconciliation evidence."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Workflow reconciliation accepted', function () { pm.response.to.have.status(200); });",
+              "const d = pm.response.json();",
+              "pm.test('Capture reconciled', function () { pm.expect(d.ok).to.eql(true); pm.expect(d.reconciled).to.eql(true); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "08 \u2014 Verify Reconciliation Idempotency",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer {{workflowSecret}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"mandateId\": \"{{mandateId}}\",\n  \"agentRunId\": \"{{agentRunId}}\",\n  \"paypalOrderId\": \"{{orderID}}\",\n  \"paypalCaptureId\": \"{{captureId}}\",\n  \"workflowRunId\": \"postman-idempotency-retry\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{baseUrl}}/api/workflow/reconcile",
+        "description": "Run after the first successful reconciliation. The same PayPal capture must resolve to the existing row and must not append a second reconciliation event."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Repeated reconciliation returns 200', function () { pm.response.to.have.status(200); });",
+              "const d = pm.response.json();",
+              "pm.test('Repeated reconciliation is idempotent', function () { pm.expect(d.ok).to.eql(true); pm.expect(d.reconciled).to.eql(true); pm.expect(d.duplicate).to.eql(true); });"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

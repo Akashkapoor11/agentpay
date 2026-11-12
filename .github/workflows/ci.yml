@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run source-check
+      - run: npm run smoke
+      - run: npm run workflows:build
+      - run: npm run build:backend
+      - run: npm run build:frontend
+      - name: Validate Postman collection JSON
+        run: node -e "const fs=require('fs'); JSON.parse(fs.readFileSync('backend/postman/AgentPay.postman_collection.json','utf8')); console.log('Postman collection OK.');"
+      - name: Verify tamper-test route exists
+        run: node -e "const fs=require('fs'); if(!fs.existsSync('backend/app/api/security/tamper-test/route.js')) throw new Error('tamper-test/route.js missing — empty directory committed'); console.log('tamper-test route present.');"
+      - name: Verify capture-order imports markMandateStatus
+        run: node -e "const fs=require('fs'); const src=fs.readFileSync('backend/app/api/paypal/capture-order/route.js','utf8'); if(!src.includes('markMandateStatus')) throw new Error('capture-order route missing markMandateStatus import'); console.log('capture-order imports OK.');"
